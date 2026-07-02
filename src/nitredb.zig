@@ -12,6 +12,8 @@ const NitreDbHeaderMagic = "NITREDB!";
 const PageSize = 8192;
 const PageHeaderSize = 64;
 const MaxRecordSize = PageSize - PageHeaderSize - DataPageSlot.Size;
+const MinPagePoolSize = 3;
+const MaxAcquiredPages = MinPagePoolSize;
 
 const NitreDbHeader = struct {
     version: u32 = 1,
@@ -92,14 +94,20 @@ const NitreDbPageHeader = struct {
 
 const NitreDbPage = struct {
     header: NitreDbPageHeader = .{},
+    data_interface: DataPageInterface,
     page_number: u32 = 0,
     last_used: u32 = 0,
     internal_flags: packed struct(u8) {
         resident: bool = false,
         dirty: bool = false,
-        _: u6 = 0,
+        acquired: bool = false,
+        _: u5 = 0,
     } = .{},
     data: [PageSize]u8 = undefined,
+
+    fn initInterface(page: *NitreDbPage) void {
+        page.data_interface = .{ .data = &page.data };
+    }
 
     fn loadFromDisk(page: *NitreDbPage, db_file: std.Io.File, page_number: u32, io: std.Io) !void {
         page.page_number = page_number;
@@ -219,57 +227,41 @@ const InsertResult = struct {
 //TODO: Finish implementing this. It needs to handle the root and intermediate index pages. When calling it
 //from another function, it should be called on the root page of a table.
 fn insertDataWithId(nitreDb: *NitreDb, page_number: u32, data: []const u8, data_id: u64) !InsertResult {
-    var page = try nitreDb.db_page_pool.acquirePageExisting(page_number, nitreDb.db_file, nitreDb.db_io);
+    var original_page = try nitreDb.db_page_pool.acquirePageExisting(nitreDb, page_number);
+    defer nitreDb.db_page_pool.releasePage(original_page);
     const data_len: u16 = @intCast(data.len);
-    var page_if: DataPageInterface = .{ .data = &page.data };
 
-    if (page.header.content_type == .Data) {
+    if (original_page.header.content_type == .Data) {
         //Return early if we can fit the data into the requested page without splitting
-        if (page.canFitRow(data_len)) {
-            page_if.insertData(data, data_id, page);
-            nitreDb.db_page_pool.releasePage(page);
+        if (original_page.canFitRow(data_len)) {
+            original_page.data_interface.insertData(data, data_id, original_page);
             return .{ .split_count = 0 };
         }
 
         //Split the page and check if the row will now fit into the original page
-        page = try splitDataPage(page, nitreDb, data_id);
-        page_if = .{ .data = &page.data };
-        var id_limit_2 = page_if.getLargestId(page.header.slot_count) orelse std.math.maxInt(u64);
-        const split_page_number_1 = page.page_number;
-        nitreDb.db_page_pool.releasePage(page);
-        page = try nitreDb.db_page_pool.acquirePageExisting(page_number, nitreDb.db_file, nitreDb.db_io);
-        if (page.canFitRow(data_len)) {
-            page_if = .{ .data = &page.data };
-            page_if.insertData(data, data_id, page);
-            nitreDb.db_page_pool.releasePage(page);
-            return .{ .split_count = 1, .id_limit_1 = data_id, .id_limit_2 = id_limit_2 };
+        var first_split = try splitDataPage(original_page, nitreDb, data_id);
+        defer nitreDb.db_page_pool.releasePage(first_split);
+        var first_split_max_id = first_split.data_interface.getLargestId(first_split.header.slot_count) orelse std.math.maxInt(u64);
+        if (original_page.canFitRow(data_len)) {
+            original_page.data_interface.insertData(data, data_id, original_page);
+            return .{ .split_count = 1, .id_limit_1 = data_id, .id_limit_2 = first_split_max_id };
         }
 
-        page_if = .{ .data = &page.data };
-        const id_limit_1 = page_if.getLargestId(page.header.slot_count) orelse std.math.maxInt(u64);
+        const original_page_max_id = original_page.data_interface.getLargestId(original_page.header.slot_count) orelse std.math.maxInt(u64);
 
         //Check if the data can fit into the page created by the split
-        nitreDb.db_page_pool.releasePage(page);
-        page = try nitreDb.db_page_pool.acquirePageExisting(split_page_number_1, nitreDb.db_file, nitreDb.db_io);
-        if (page.canFitRow(data_len)) {
-            page_if = .{ .data = &page.data };
-            page_if.insertData(data, data_id, page);
-            id_limit_2 = page_if.getLargestId(page.header.slot_count) orelse std.math.maxInt(u64);
-            nitreDb.db_page_pool.releasePage(page);
-            return .{ .split_count = 1, .id_limit_1 = id_limit_1, .id_limit_2 = id_limit_2 };
+        if (first_split.canFitRow(data_len)) {
+            first_split.data_interface.insertData(data, data_id, first_split);
+            first_split_max_id = first_split.data_interface.getLargestId(first_split.header.slot_count) orelse std.math.maxInt(u64);
+            return .{ .split_count = 1, .id_limit_1 = original_page_max_id, .id_limit_2 = first_split_max_id };
         }
 
         //At this point, the record doesn't fit into either the original page or the new page created by the split
         //It will have to go in its own page
-        page = try splitDataPage(page, nitreDb, 0);
-        page_if = .{ .data = &page.data };
-        const id_limit_3 = page_if.getLargestId(page.header.slot_count) orelse std.math.maxInt(u64);
-        nitreDb.db_page_pool.releasePage(page);
-        page = try nitreDb.db_page_pool.acquirePageExisting(split_page_number_1, nitreDb.db_file, nitreDb.db_io);
-        page_if = .{ .data = &page.data };
-        page_if.insertData(data, data_id, page);
-        nitreDb.db_page_pool.releasePage(page);
-        return .{ .split_count = 2, .id_limit_1 = id_limit_1, .id_limit_2 = data_id, .id_limit_3 = id_limit_3 };
+        const second_split = try splitDataPage(first_split, nitreDb, 0);
+        defer nitreDb.db_page_pool.releasePage(second_split);
+        first_split.data_interface.insertData(data, data_id, first_split);
+        return .{ .split_count = 2, .id_limit_1 = original_page_max_id, .id_limit_2 = data_id, .id_limit_3 = first_split_max_id };
     }
 
     //TODO: Implement handling the root and intermediate index pages
@@ -277,10 +269,8 @@ fn insertDataWithId(nitreDb: *NitreDb, page_number: u32, data: []const u8, data_
 }
 
 //Splits a data page by moving all the records with a primary key >= to the upper bound to a new page.
-//Returns the new page.
+//Returns the new page
 fn splitDataPage(page: *NitreDbPage, nitreDb: *NitreDb, upper_bound_id: u64) !*NitreDbPage {
-    const original_page_number = page.page_number;
-    const original_page_next = page.header.next_page;
     const slot_count = page.header.slot_count;
     page.header.slot_count = 0;
     page.header.data_length = 0;
@@ -315,37 +305,27 @@ fn splitDataPage(page: *NitreDbPage, nitreDb: *NitreDb, upper_bound_id: u64) !*N
         page.header.data_length += slot.length;
     }
 
-    //Release the original page and acquire the new one we're splitting into
-    nitreDb.db_page_pool.releasePage(page);
-    var new_page = try nitreDb.db_page_pool.acquirePageNew(nitreDb, null, null, .Data);
+    var new_page = try nitreDb.db_page_pool.acquirePageNew(nitreDb);
     new_page.internal_flags.dirty = true;
+    new_page.header.content_type = .Data;
     address_counter = PageHeaderSize;
-    var new_page_if: DataPageInterface = .{ .data = &new_page.data };
 
     //Copy the slot and row data from temp into the new page
     for (next_slot_idx..slot_count) |slot_idx| {
         const slot_number: u16 = @intCast(slot_idx);
         var slot = temp_page_if.readSlot(slot_number);
-        new_page_if.writeRaw(temp_data[slot.offset..][0..slot.length], address_counter);
+        new_page.data_interface.writeRaw(temp_data[slot.offset..][0..slot.length], address_counter);
         slot.offset = address_counter;
-        new_page_if.writeSlot(new_page.header.slot_count, &slot);
+        new_page.data_interface.writeSlot(new_page.header.slot_count, &slot);
         address_counter += slot.length;
         new_page.header.slot_count += 1;
         new_page.header.data_length += slot.length;
     }
 
-    //We need to update the next ptr of the original page to point to the new page. This could be optimized but the current
-    //implementation of the page pool limits us to only having 1 page checked out at a time. TODO: Optimize this nonsense
-    const new_page_number = new_page.page_number;
-    new_page.header.prev_page = original_page_number;
-    new_page.header.next_page = original_page_next;
-    new_page.internal_flags.dirty = true;
-    nitreDb.db_page_pool.releasePage(new_page);
-    var original_page = try nitreDb.db_page_pool.acquirePageExisting(original_page_number, nitreDb.db_file, nitreDb.db_io);
-    original_page.header.next_page = new_page_number;
-    original_page.internal_flags.dirty = true;
-    nitreDb.db_page_pool.releasePage(original_page);
-    new_page = try nitreDb.db_page_pool.acquirePageExisting(new_page_number, nitreDb.db_file, nitreDb.db_io);
+    //We need to update the next and prev ptrs
+    new_page.header.prev_page = page.page_number;
+    new_page.header.next_page = page.header.next_page;
+    page.header.next_page = new_page.page_number;
 
     return new_page;
 }
@@ -353,10 +333,11 @@ fn splitDataPage(page: *NitreDbPage, nitreDb: *NitreDb, upper_bound_id: u64) !*N
 pub fn insertRecord(nitreDb: *NitreDb, record: []const u8, id: u64) !void {
     var page_opt: ?*NitreDbPage = null;
     if (nitreDb.db_header.page_count == 0) {
-        page_opt = try nitreDb.db_page_pool.acquirePageNew(nitreDb, null, null, .Data);
-        nitreDb.db_header.first_data_page += page_opt.?.page_number;
+        page_opt = try nitreDb.db_page_pool.acquirePageNew(nitreDb);
+        page_opt.?.header.content_type = .Data;
+        nitreDb.db_header.first_data_page = page_opt.?.page_number;
     } else {
-        page_opt = try nitreDb.db_page_pool.acquirePageExisting(nitreDb.db_header.first_data_page, nitreDb.db_file, nitreDb.db_io);
+        page_opt = try nitreDb.db_page_pool.acquirePageExisting(nitreDb, nitreDb.db_header.first_data_page);
     }
     var page = page_opt.?;
     page.internal_flags.dirty = true;
@@ -374,75 +355,39 @@ pub fn insertRecord(nitreDb: *NitreDb, record: []const u8, id: u64) !void {
 }
 
 pub fn walkRecordsTest(nitreDb: *NitreDb) !void {
-    var page_opt: ?*NitreDbPage = null;
-    if (nitreDb.db_header.page_count == 0) {
-        page_opt = try nitreDb.db_page_pool.acquirePageNew(nitreDb, null, null, .Data);
-        nitreDb.db_header.first_data_page += page_opt.?.page_number;
-    } else {
-        page_opt = try nitreDb.db_page_pool.acquirePageExisting(nitreDb.db_header.first_data_page, nitreDb.db_file, nitreDb.db_io);
-    }
-    var page = page_opt.?;
-    var page_if: DataPageInterface = .{ .data = &page.data };
-    var reader = std.Io.Reader.fixed(&page.data);
     var print_buffer: [128]u8 = undefined;
-    for (0..page.header.slot_count) |idx| {
-        const slot_idx: u16 = @intCast(idx);
-        const slot = page_if.readSlot(slot_idx);
-        reader.seek = slot.offset + 8;
-        const len = try reader.takeInt(u32, .little);
-        try reader.readSliceAll(print_buffer[0..len]);
-        std.debug.print("{s}\n", .{print_buffer[0..len]});
+    var page_number: u32 = nitreDb.db_header.first_data_page;
+    while (page_number != std.math.maxInt(u32)) {
+        var page = try nitreDb.db_page_pool.acquirePageExisting(nitreDb, page_number);
+        defer nitreDb.db_page_pool.releasePage(page);
+        var reader = std.Io.Reader.fixed(&page.data);
+        for (0..page.header.slot_count) |idx| {
+            const slot_idx: u16 = @intCast(idx);
+            const slot = page.data_interface.readSlot(slot_idx);
+            reader.seek = slot.offset + 8;
+            const len = try reader.takeInt(u32, .little);
+            try reader.readSliceAll(print_buffer[0..len]);
+            std.debug.print("{s} (Page number: {})\n", .{ print_buffer[0..len], page_number });
+        }
+        page_number = page.header.next_page orelse std.math.maxInt(u32);
     }
-
-    if (page.header.next_page == null) {
-        nitreDb.db_page_pool.releasePage(page);
-        return;
-    }
-
-    const next_page = page.header.next_page orelse unreachable;
-    nitreDb.db_page_pool.releasePage(page);
-
-    page = try nitreDb.db_page_pool.acquirePageExisting(next_page, nitreDb.db_file, nitreDb.db_io);
-    page_if = .{ .data = &page.data };
-    for (0..page.header.slot_count) |idx| {
-        const slot_idx: u16 = @intCast(idx);
-        const slot = page_if.readSlot(slot_idx);
-        reader.seek = slot.offset + 8;
-        const len = try reader.takeInt(u32, .little);
-        try reader.readSliceAll(print_buffer[0..len]);
-        std.debug.print("{s}\n", .{print_buffer[0..len]});
-    }
-}
-
-pub fn splitPageTest(nitreDb: *NitreDb, boundary: u64) !void {
-    var page_opt: ?*NitreDbPage = null;
-    if (nitreDb.db_header.page_count == 0) {
-        page_opt = try nitreDb.db_page_pool.acquirePageNew(nitreDb, null, null, .Data);
-        nitreDb.db_header.first_data_page += page_opt.?.page_number;
-    } else {
-        page_opt = try nitreDb.db_page_pool.acquirePageExisting(nitreDb.db_header.first_data_page, nitreDb.db_file, nitreDb.db_io);
-    }
-    var page = page_opt.?;
-
-    page = try splitDataPage(page, nitreDb, boundary);
-    nitreDb.db_page_pool.releasePage(page);
 }
 
 pub fn flushDatabase(nitreDb: *NitreDb) !void {
-    try nitreDb.db_page_pool.flushAll(nitreDb.db_file, nitreDb.db_io);
     try writeHeader(nitreDb.db_file, &nitreDb.db_header, nitreDb.db_io);
+    try flushAllPages(nitreDb);
 }
 
 pub fn closeDatabase(nitreDb: *NitreDb) void {
     nitreDb.db_file.close(nitreDb.db_io);
-    nitreDb.db_page_pool.deinit();
+    nitreDb.db_page_pool.deinit(nitreDb.db_allocator);
 }
 
 pub fn openDatabase(filepath: []const u8, io: std.Io, allocator: std.mem.Allocator) !NitreDb {
     const file = try std.Io.Dir.createFileAbsolute(io, filepath, .{ .truncate = false, .read = true });
     errdefer file.close(io);
-    var page_pool = try PagePool.init(1, allocator);
-    errdefer page_pool.deinit();
+    var page_pool = try PagePool.init(MinPagePoolSize, allocator);
+    errdefer page_pool.deinit(allocator);
     const file_length = try file.length(io);
     var header: NitreDbHeader = .{};
 
@@ -511,45 +456,36 @@ fn readHeader(file: std.Io.File, header: *NitreDbHeader, io: std.Io) !void {
 
 //Implements a pool of pages used to store page data loaded from the disk
 const PagePool = struct {
-    allocator: std.mem.Allocator,
-    page_pool: []NitreDbPage,
-    active_page: ?*NitreDbPage,
+    pages: []NitreDbPage,
     last_used_counter: u32,
+    active_page_count: u32,
 
     fn init(size: u32, allocator: std.mem.Allocator) !PagePool {
         const pool = try allocator.alloc(NitreDbPage, size);
         for (pool) |*page| {
-            page.* = .{};
+            page.* = .{
+                .data_interface = .{
+                    .data = &page.data,
+                },
+            };
         }
 
-        return .{ .allocator = allocator, .page_pool = pool, .active_page = null, .last_used_counter = 0 };
+        return .{
+            .pages = pool,
+            .active_page_count = 0,
+            .last_used_counter = 0,
+        };
     }
 
-    fn flushPage(page: *NitreDbPage, db_file: std.Io.File, io: std.Io) !void {
-        std.debug.print("Flushing page: {*} ({})\n", .{ page, page.page_number });
-        try page.writeToDisk(db_file, io);
-        page.internal_flags.dirty = false;
-    }
-
-    fn flushAll(pool: *PagePool, db_file: std.Io.File, io: std.Io) !void {
-        for (pool.page_pool) |*page| {
-            if (page.internal_flags.dirty and page.internal_flags.resident) {
-                try flushPage(page, db_file, io);
-                page.internal_flags.dirty = false;
-                page.internal_flags.resident = false;
-            }
-        }
-    }
-
-    fn deinit(pool: *PagePool) void {
-        pool.allocator.free(pool.page_pool);
+    fn deinit(pool: *PagePool, allocator: std.mem.Allocator) void {
+        allocator.free(pool.pages);
     }
 
     //Gets a page from the pool, freeing the oldest if none are available
-    fn getFreePage(pool: *PagePool, db_file: std.Io.File, io: std.Io) !*NitreDbPage {
-        var oldest_page: *NitreDbPage = &pool.page_pool[0];
+    fn getFreePage(pool: *PagePool, nitreDb: *NitreDb) !*NitreDbPage {
+        var oldest_page: *NitreDbPage = &pool.pages[0];
 
-        for (pool.page_pool) |*page| {
+        for (pool.pages) |*page| {
             if (!page.internal_flags.resident) {
                 return page;
             }
@@ -560,69 +496,105 @@ const PagePool = struct {
 
         //Evict page from the pool because it's the oldest and the pool is full
         if (oldest_page.internal_flags.dirty) {
-            try flushPage(oldest_page, db_file, io);
+            try writePageToDisk(nitreDb, oldest_page);
+            oldest_page.internal_flags.dirty = false;
         }
 
         return oldest_page;
     }
 
-    fn acquirePageNew(pool: *PagePool, nitreDb: *NitreDb, next_page: ?u32, prev_page: ?u32, content_type: NitreDbPageContentType) !*NitreDbPage {
-        if (pool.active_page != null) {
-            return error.PageAlreadyAcquired;
+    //Finds a page already loaded into the pool by its number
+    fn findPage(pool: *const PagePool, page_number: u32) ?*NitreDbPage {
+        for (pool.pages) |*page| {
+            if (page.page_number == page_number and page.internal_flags.resident) {
+                return page;
+            }
         }
-        const page = try pool.getFreePage(nitreDb.db_file, nitreDb.db_io);
+        return null;
+    }
+
+    fn acquirePageNew(pool: *PagePool, nitreDb: *NitreDb) !*NitreDbPage {
+        if (pool.active_page_count >= MaxAcquiredPages) {
+            return error.MaxAcquisitionsReached;
+        }
+        const page = try pool.getFreePage(nitreDb);
         page.* = .{
-            .header = .{
-                .content_type = content_type,
-                .next_page = next_page,
-                .prev_page = prev_page,
-                .slot_count = 0,
-            },
             .page_number = nitreDb.db_header.page_count,
             .last_used = pool.last_used_counter,
-            .internal_flags = .{ .dirty = true, .resident = true },
-            .data = undefined,
+            .internal_flags = .{ .dirty = true, .resident = true, .acquired = true },
+            .data_interface = .{
+                .data = &page.data,
+            },
         };
+        page.initInterface();
         pool.last_used_counter += 1;
+        pool.active_page_count += 1;
         nitreDb.db_header.page_count += 1;
 
-        std.debug.print("Acquiring page: {*}\n", .{page});
+        std.debug.print("Acquiring page: {*} (Page number: {})\n", .{ page, page.page_number });
         return page;
     }
 
     //Gets a free page from the pool and loads the contents from disk
-    fn acquirePageExisting(pool: *PagePool, page_number: u32, db_file: std.Io.File, io: std.Io) !*NitreDbPage {
-        if (pool.active_page != null) {
-            return error.PageAlreadyAcquired;
+    fn acquirePageExisting(pool: *PagePool, nitreDb: *NitreDb, page_number: u32) !*NitreDbPage {
+        if (pool.active_page_count >= MaxAcquiredPages) {
+            return error.MaxAcquisitionsReached;
+        }
+        const found_page = pool.findPage(page_number);
+        if (found_page != null) {
+            if (found_page.?.internal_flags.acquired) {
+                return error.PageAlreadyAcquired;
+            }
+            pool.active_page_count += 1;
+            return found_page.?;
         }
 
-        for (pool.page_pool) |*page| {
-            if (page.page_number == page_number and page.internal_flags.resident)
-                return page;
-        }
-
-        var page = try pool.getFreePage(db_file, io);
-        try page.loadFromDisk(db_file, page_number, io);
+        var page = try pool.getFreePage(nitreDb);
+        try loadPageFromDisk(nitreDb, page, page_number);
+        page.initInterface();
         page.internal_flags.resident = true;
+        page.internal_flags.acquired = true;
         page.last_used = pool.last_used_counter;
         pool.last_used_counter += 1;
+        pool.active_page_count += 1;
 
-        std.debug.print("Acquiring page: {*}\n", .{page});
+        std.debug.print("Acquiring page: {*} (Page number: {})\n", .{ page, page.page_number });
         return page;
     }
 
     //Returns a page to the pool
     fn releasePage(pool: *PagePool, page: *NitreDbPage) void {
-        if (pool.active_page == null) {
-            return;
-        }
-
-        const active_page = pool.active_page.?;
-
-        if (active_page != page) {
-            return;
-        }
-
-        pool.active_page = null;
+        page.internal_flags.acquired = false;
+        pool.active_page_count -= 1;
     }
 };
+
+//Loads page contents from the disk
+fn loadPageFromDisk(nitreDb: *NitreDb, page: *NitreDbPage, page_number: u32) !void {
+    page.page_number = page_number;
+    var reader = nitreDb.db_file.reader(nitreDb.db_io, &page.data);
+    try reader.seekTo(NitreDbHeaderSize + page.page_number * PageSize);
+    try reader.interface.fill(page.data.len);
+    var header_reader = std.Io.Reader.fixed(&page.data);
+    try page.header.read(&header_reader);
+}
+
+//Writes the contents of a page to disk, reglardless of the dirty flag
+fn writePageToDisk(nitreDb: *NitreDb, page: *NitreDbPage) !void {
+    std.debug.print("Flushing page: {*} (Page number: {})\n", .{ page, page.page_number });
+    var writer = std.Io.Writer.fixed(&page.data);
+    try page.header.write(&writer);
+    var file_writer = nitreDb.db_file.writer(nitreDb.db_io, &[0]u8{});
+    try file_writer.seekTo(NitreDbHeaderSize + page.page_number * PageSize);
+    try file_writer.interface.writeAll(&page.data);
+}
+
+//Flushes all loaded back to the disk if they are dirty
+fn flushAllPages(nitreDb: *NitreDb) !void {
+    for (nitreDb.db_page_pool.pages) |*page| {
+        if (page.internal_flags.dirty) {
+            try writePageToDisk(nitreDb, page);
+            page.internal_flags.dirty = false;
+        }
+    }
+}
