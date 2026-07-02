@@ -1,0 +1,4 @@
+* Find a way to be more consistent about setting the dirty flag on pages. Changing page header values doesn't trigger
+    the dirty flag to be set.
+* Update the page pool to allow for more than 1 page to be checked out at a time. We'll have to set a minimum limit on
+    the pool size (it's currently 1). Having at least 2 avaiable at any time would be a huge boon to performance.
