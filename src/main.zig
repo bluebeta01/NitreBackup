@@ -9,12 +9,22 @@ pub fn main(init: std.process.Init) !void {
     var buffer: [256]u8 = undefined;
     const seed: u64 = @intCast(std.Io.Clock.real.now(io).toSeconds());
     var rand = std.Random.DefaultPrng.init(seed);
-    for (1..234) |_| {
+    //max is 233 records per page
+
+    var id_count: u32 = 0;
+
+    const t1: u64 = @intCast(std.Io.Clock.real.now(io).toMilliseconds());
+    for (1..10_000) |_| {
         const rand_idx = rand.next() % 100;
+        id_count += 1;
         const fmt_buffer = try std.fmt.bufPrint(&buffer, "This is record: {:0>2}", .{rand_idx});
         try nitreDb.insertRecord(fmt_buffer, rand_idx);
     }
-    try nitreDb.walkRecordsTest();
+    const t2: u64 = @intCast(std.Io.Clock.real.now(io).toMilliseconds());
+
+    const count = try nitreDb.walkRecordsTest();
+    std.debug.print("Inserted: {}, Count: {}\n", .{ id_count, count });
+    std.debug.print("Insertion Time: {}ms\n", .{t2 - t1});
     //try nitreDb.splitPageTest(50);
     try nitreDb.flushDatabase();
     defer nitreDb.closeDatabase();

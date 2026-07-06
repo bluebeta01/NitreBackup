@@ -14,6 +14,7 @@ const PageHeaderSize = 64;
 const MaxRecordSize = PageSize - PageHeaderSize - DataPageSlot.Size;
 const MinPagePoolSize = 3;
 const MaxAcquiredPages = MinPagePoolSize;
+const MaxPrimaryIndexSlotsPerPage = 600;
 
 const NitreDbHeader = struct {
     version: u32 = 1,
@@ -28,6 +29,17 @@ const DbEntry = struct {
     archive_name: []const u8,
     created_time: u64,
     modified_time: u64,
+};
+
+const PrimaryIndexSlot = packed struct {
+    const Size = @bitSizeOf(PrimaryIndexSlot) / 8;
+    //The largest id that this slot spans in the data structure
+    upper_limit: u64 = 0,
+    //The page that this slot points to in the next level of the data structure
+    page_number: u32 = 0,
+    flags: packed struct(u8) {
+        _: u8 = 0,
+    } = .{},
 };
 
 const DataPageSlot = packed struct {
@@ -45,8 +57,7 @@ const DataPageSlot = packed struct {
 
 const NitreDbPageContentType = enum(u32) {
     Data = 0,
-    Index = 1,
-    ClusteredIndex = 2,
+    PrimaryIndex = 1,
 };
 
 //Page header will be stored on disk as content_type(u8), slot_count(u16), next_page(u32), prev_page(u32), data_length(u16)
@@ -95,6 +106,7 @@ const NitreDbPageHeader = struct {
 const NitreDbPage = struct {
     header: NitreDbPageHeader = .{},
     data_interface: DataPageInterface,
+    pindex_interface: PIndexPageInterface,
     page_number: u32 = 0,
     last_used: u32 = 0,
     internal_flags: packed struct(u8) {
@@ -107,6 +119,7 @@ const NitreDbPage = struct {
 
     fn initInterface(page: *NitreDbPage) void {
         page.data_interface = .{ .data = &page.data };
+        page.pindex_interface = .{ .data = &page.data };
     }
 
     fn loadFromDisk(page: *NitreDbPage, db_file: std.Io.File, page_number: u32, io: std.Io) !void {
@@ -133,6 +146,52 @@ const NitreDbPage = struct {
         const free_space = PageSize - (page.header.data_length + PageHeaderSize + page.header.slot_count * DataPageSlot.Size);
         const required_space = size + DataPageSlot.Size;
         return required_space <= free_space;
+    }
+};
+
+const PIndexPageInterface = struct {
+    data: []u8,
+
+    //Finds the slot in the page that defines the range that id would fall into. Returns the slot number.
+    fn findSlot(interface: *const PIndexPageInterface, page: *const NitreDbPage, id: u64) u16 {
+        std.debug.assert(page.header.slot_count > 0);
+        var reader = std.Io.Reader.fixed(interface.data);
+        var slot_number: u16 = 0;
+        var start: u16 = 0;
+        var end: u16 = page.header.slot_count - 1;
+
+        while (true) {
+            slot_number = (start + end) / 2;
+            reader.seek = PageSize - PrimaryIndexSlot.Size * (slot_number + 1);
+            const slot = reader.takeStruct(PrimaryIndexSlot, .little) catch unreachable;
+            if (id == slot.upper_limit or start == end) {
+                break;
+            }
+            if (id > slot.upper_limit) {
+                start = slot_number + 1;
+            } else {
+                if (end == start + 1) {
+                    end = start;
+                } else {
+                    end = slot_number - 1;
+                }
+            }
+        }
+
+        //It's possible that after the binary search, we end up on the slot 1 less than where we need to be
+        //because the slots represent an upper limit. Adjust for this.
+        reader.seek = PageSize - PrimaryIndexSlot.Size * (slot_number + 1);
+        var slot = reader.takeStruct(PrimaryIndexSlot, .little) catch unreachable;
+        if (id > slot.upper_limit) {
+            slot_number += 1;
+            reader.seek = PageSize - PrimaryIndexSlot.Size * (slot_number + 1);
+            slot = reader.takeStruct(PrimaryIndexSlot, .little) catch unreachable;
+        }
+
+        std.debug.assert(slot_number <= page.header.slot_count);
+        std.debug.assert(id <= slot.upper_limit);
+
+        return slot_number;
     }
 };
 
@@ -218,24 +277,207 @@ const DataPageInterface = struct {
 
 const InsertResult = struct {
     split_count: u32,
-    //The largest id in each of the pages involved in the insert if the insert involved a split.
-    id_limit_1: u64 = 0,
-    id_limit_2: u64 = 0,
-    id_limit_3: u64 = 0,
+    split_results: [3]struct {
+        page_number: u32 = std.math.maxInt(u32),
+        id_upper_limit: u64 = 0,
+    },
 };
+
+fn insertDataWithId(nitreDb: *NitreDb, data: []const u8, data_id: u64) !u32 {
+    const page_number = nitreDb.db_header.first_data_page;
+    const result = try insertDataRecursive(nitreDb, page_number, data, data_id);
+    if (result.split_count == 0) {
+        return page_number;
+    }
+
+    std.debug.assert(result.split_count == 1);
+
+    var new_root_page = try nitreDb.db_page_pool.acquirePageNew(nitreDb);
+    defer nitreDb.db_page_pool.releasePage(new_root_page);
+    new_root_page.header.content_type = .PrimaryIndex;
+    new_root_page.internal_flags.dirty = true;
+    new_root_page.header.slot_count = 2;
+
+    const lesser_slot: PrimaryIndexSlot = .{
+        .page_number = result.split_results[0].page_number,
+        .upper_limit = result.split_results[0].id_upper_limit,
+    };
+    const greater_slot: PrimaryIndexSlot = .{
+        .page_number = result.split_results[1].page_number,
+        .upper_limit = result.split_results[1].id_upper_limit,
+    };
+
+    var writer = std.Io.Writer.fixed(&new_root_page.data);
+    writer.end = PageSize - PrimaryIndexSlot.Size * 2;
+    writer.writeStruct(greater_slot, .little) catch unreachable;
+    writer.writeStruct(lesser_slot, .little) catch unreachable;
+
+    return new_root_page.page_number;
+}
 
 //TODO: Finish implementing this. It needs to handle the root and intermediate index pages. When calling it
 //from another function, it should be called on the root page of a table.
-fn insertDataWithId(nitreDb: *NitreDb, page_number: u32, data: []const u8, data_id: u64) !InsertResult {
+fn insertDataRecursive(nitreDb: *NitreDb, page_number: u32, data: []const u8, data_id: u64) !InsertResult {
     var original_page = try nitreDb.db_page_pool.acquirePageExisting(nitreDb, page_number);
-    defer nitreDb.db_page_pool.releasePage(original_page);
     const data_len: u16 = @intCast(data.len);
+
+    if (original_page.header.content_type == .PrimaryIndex) {
+
+        //Generate a new data page if the primary index page is empty
+        if (original_page.header.slot_count == 0) {
+            var new_page = try nitreDb.db_page_pool.acquirePageNew(nitreDb);
+            new_page.internal_flags.dirty = true;
+            new_page.header.content_type = .Data;
+            const new_slot: PrimaryIndexSlot = .{
+                .page_number = new_page.page_number,
+                .upper_limit = std.math.maxInt(u64),
+            };
+            var writer = std.Io.Writer.fixed(&original_page.data);
+            writer.end = PageSize - PrimaryIndexSlot.Size;
+            writer.writeStruct(new_slot, .little) catch unreachable;
+            original_page.header.slot_count += 1;
+            original_page.internal_flags.dirty = true;
+            nitreDb.db_page_pool.releasePage(original_page);
+            const new_page_number = new_page.page_number;
+            nitreDb.db_page_pool.releasePage(new_page);
+            _ = try insertDataRecursive(nitreDb, new_page_number, data, data_id);
+            return .{ .split_count = 0, .split_results = undefined };
+        }
+
+        const slot_number = original_page.pindex_interface.findSlot(original_page, data_id);
+        var reader = std.Io.Reader.fixed(&original_page.data);
+        reader.seek = PageSize - PrimaryIndexSlot.Size * (slot_number + 1);
+        const original_slot = reader.takeStruct(PrimaryIndexSlot, .little) catch unreachable;
+        nitreDb.db_page_pool.releasePage(original_page);
+        const result = try insertDataRecursive(nitreDb, original_slot.page_number, data, data_id);
+        if (result.split_count == 0) {
+            return .{ .split_count = 0, .split_results = undefined };
+        }
+
+        //Update the original slot with the new upper limit
+        original_page = try nitreDb.db_page_pool.acquirePageExisting(nitreDb, page_number);
+        defer nitreDb.db_page_pool.releasePage(original_page);
+        original_page.internal_flags.dirty = true;
+        reader = std.Io.Reader.fixed(&original_page.data);
+        var writer = std.Io.Writer.fixed(&original_page.data);
+        writer.end = PageSize - PrimaryIndexSlot.Size * (slot_number + 1);
+        var updated_slot = original_slot;
+        updated_slot.upper_limit = result.split_results[0].id_upper_limit;
+        writer.writeStruct(updated_slot, .little) catch unreachable;
+
+        var slot_buffer: [PrimaryIndexSlot.Size * (MaxPrimaryIndexSlotsPerPage + 2)]u8 = undefined;
+        var slot_buffer_count = result.split_count;
+        var slot_buffer_writer = std.Io.Writer.fixed(&slot_buffer);
+
+        if (result.split_count == 2) {
+            slot_buffer_writer.end = slot_buffer.len - PrimaryIndexSlot.Size * 2;
+            const split_slot_1: PrimaryIndexSlot = .{
+                .page_number = result.split_results[1].page_number,
+                .upper_limit = result.split_results[1].id_upper_limit,
+            };
+            var split_slot_2: PrimaryIndexSlot = .{
+                .page_number = result.split_results[2].page_number,
+                .upper_limit = result.split_results[2].id_upper_limit,
+            };
+            //Ensure we don't limit the range of the largest slot if it is unbounded
+            if (original_slot.upper_limit == std.math.maxInt(u64)) {
+                split_slot_2.upper_limit = std.math.maxInt(u64);
+            }
+            slot_buffer_writer.writeStruct(split_slot_2, .little) catch unreachable;
+            slot_buffer_writer.writeStruct(split_slot_1, .little) catch unreachable;
+        } else {
+            slot_buffer_writer.end = slot_buffer.len - PrimaryIndexSlot.Size;
+            var split_slot_1: PrimaryIndexSlot = .{
+                .page_number = result.split_results[1].page_number,
+                .upper_limit = result.split_results[1].id_upper_limit,
+            };
+            //Ensure we don't limit the range of the largest slot if it is unbounded
+            if (original_slot.upper_limit == std.math.maxInt(u64)) {
+                split_slot_1.upper_limit = std.math.maxInt(u64);
+            }
+            slot_buffer_writer.writeStruct(split_slot_1, .little) catch unreachable;
+        }
+
+        //Get the number of slots in the page above the original slot
+        const slot_move_count = original_page.header.slot_count - slot_number - 1;
+
+        if (slot_move_count > 0) {
+            const src_start = PageSize - PrimaryIndexSlot.Size * (original_page.header.slot_count);
+            const src_end = src_start + PrimaryIndexSlot.Size * slot_move_count;
+            const dst_start = slot_buffer.len - PrimaryIndexSlot.Size * (slot_buffer_count + slot_move_count);
+            const dst_end = dst_start + PrimaryIndexSlot.Size * slot_move_count;
+            @memcpy(slot_buffer[dst_start..dst_end], original_page.data[src_start..src_end]);
+            slot_buffer_count += slot_move_count;
+        }
+
+        original_page.header.slot_count -= slot_move_count;
+        const original_page_capacity = MaxPrimaryIndexSlotsPerPage - original_page.header.slot_count;
+        var slots_moved_original_page: u16 = 0;
+
+        if (original_page_capacity > 0) {
+            var slots_to_move: u16 = @intCast(slot_buffer_count);
+            if (original_page_capacity < slots_to_move) {
+                slots_to_move = original_page_capacity;
+            }
+            const src_start = slot_buffer.len - PrimaryIndexSlot.Size * slots_to_move;
+            const src_end = src_start + PrimaryIndexSlot.Size * slots_to_move;
+            const dst_start = PageSize - PrimaryIndexSlot.Size * (original_page.header.slot_count + slots_to_move);
+            const dst_end = dst_start + PrimaryIndexSlot.Size * slots_to_move;
+            @memcpy(original_page.data[dst_start..dst_end], slot_buffer[src_start..src_end]);
+            original_page.header.slot_count += slots_to_move;
+            slots_moved_original_page = slots_to_move;
+        }
+
+        const new_page_slots: u16 = @intCast(slot_buffer_count - slots_moved_original_page);
+
+        //If all slots ended up in the original page, we can return early without allocating a new page
+        if (new_page_slots == 0) {
+            return .{ .split_count = 0, .split_results = undefined };
+        } else {
+            //TODO: This branch is not thoroughly tested!
+            var new_page = try nitreDb.db_page_pool.acquirePageNew(nitreDb);
+            defer nitreDb.db_page_pool.releasePage(new_page);
+            new_page.internal_flags.dirty = true;
+            new_page.header.content_type = .PrimaryIndex;
+            new_page.header.slot_count = new_page_slots;
+
+            const src_start = slot_buffer.len - PrimaryIndexSlot.Size * slot_buffer_count;
+            const src_end = src_start + PrimaryIndexSlot.Size * new_page_slots;
+            const dst_start = PageSize - PrimaryIndexSlot.Size * new_page_slots;
+            const dst_end = dst_start + PrimaryIndexSlot.Size * new_page_slots;
+            @memcpy(new_page.data[dst_start..dst_end], slot_buffer[src_start..src_end]);
+
+            reader.seek = PageSize - PrimaryIndexSlot.Size * original_page.header.slot_count;
+            const original_page_largest_slot = reader.takeStruct(PrimaryIndexSlot, .little) catch unreachable;
+
+            var new_page_reader = std.Io.Reader.fixed(&new_page.data);
+            new_page_reader.seek = PageSize - PrimaryIndexSlot.Size * new_page.header.slot_count;
+            const new_page_largest_slot = new_page_reader.takeStruct(PrimaryIndexSlot, .little) catch unreachable;
+
+            return .{
+                .split_count = 1,
+                .split_results = .{
+                    .{
+                        .page_number = original_page.page_number,
+                        .id_upper_limit = original_page_largest_slot.upper_limit,
+                    },
+                    .{
+                        .page_number = new_page.page_number,
+                        .id_upper_limit = new_page_largest_slot.upper_limit,
+                    },
+                    undefined,
+                },
+            };
+        }
+    }
+
+    defer nitreDb.db_page_pool.releasePage(original_page);
 
     if (original_page.header.content_type == .Data) {
         //Return early if we can fit the data into the requested page without splitting
         if (original_page.canFitRow(data_len)) {
             original_page.data_interface.insertData(data, data_id, original_page);
-            return .{ .split_count = 0 };
+            return .{ .split_count = 0, .split_results = undefined };
         }
 
         //Split the page and check if the row will now fit into the original page
@@ -244,7 +486,20 @@ fn insertDataWithId(nitreDb: *NitreDb, page_number: u32, data: []const u8, data_
         var first_split_max_id = first_split.data_interface.getLargestId(first_split.header.slot_count) orelse std.math.maxInt(u64);
         if (original_page.canFitRow(data_len)) {
             original_page.data_interface.insertData(data, data_id, original_page);
-            return .{ .split_count = 1, .id_limit_1 = data_id, .id_limit_2 = first_split_max_id };
+            return .{
+                .split_count = 1,
+                .split_results = .{
+                    .{
+                        .page_number = original_page.page_number,
+                        .id_upper_limit = data_id,
+                    },
+                    .{
+                        .page_number = first_split.page_number,
+                        .id_upper_limit = first_split_max_id,
+                    },
+                    undefined,
+                },
+            };
         }
 
         const original_page_max_id = original_page.data_interface.getLargestId(original_page.header.slot_count) orelse std.math.maxInt(u64);
@@ -253,7 +508,20 @@ fn insertDataWithId(nitreDb: *NitreDb, page_number: u32, data: []const u8, data_
         if (first_split.canFitRow(data_len)) {
             first_split.data_interface.insertData(data, data_id, first_split);
             first_split_max_id = first_split.data_interface.getLargestId(first_split.header.slot_count) orelse std.math.maxInt(u64);
-            return .{ .split_count = 1, .id_limit_1 = original_page_max_id, .id_limit_2 = first_split_max_id };
+            return .{
+                .split_count = 1,
+                .split_results = .{
+                    .{
+                        .page_number = original_page.page_number,
+                        .id_upper_limit = original_page_max_id,
+                    },
+                    .{
+                        .page_number = first_split.page_number,
+                        .id_upper_limit = first_split_max_id,
+                    },
+                    undefined,
+                },
+            };
         }
 
         //At this point, the record doesn't fit into either the original page or the new page created by the split
@@ -261,7 +529,24 @@ fn insertDataWithId(nitreDb: *NitreDb, page_number: u32, data: []const u8, data_
         const second_split = try splitDataPage(first_split, nitreDb, 0);
         defer nitreDb.db_page_pool.releasePage(second_split);
         first_split.data_interface.insertData(data, data_id, first_split);
-        return .{ .split_count = 2, .id_limit_1 = original_page_max_id, .id_limit_2 = data_id, .id_limit_3 = first_split_max_id };
+        //return .{ .split_count = 2, .id_limit_1 = original_page_max_id, .id_limit_2 = data_id, .id_limit_3 = first_split_max_id };
+        return .{
+            .split_count = 2,
+            .split_results = .{
+                .{
+                    .page_number = original_page.page_number,
+                    .id_upper_limit = original_page_max_id,
+                },
+                .{
+                    .page_number = first_split.page_number,
+                    .id_upper_limit = data_id,
+                },
+                .{
+                    .page_number = second_split.page_number,
+                    .id_upper_limit = first_split_max_id,
+                },
+            },
+        };
     }
 
     //TODO: Implement handling the root and intermediate index pages
@@ -276,7 +561,7 @@ fn splitDataPage(page: *NitreDbPage, nitreDb: *NitreDb, upper_bound_id: u64) !*N
     page.header.data_length = 0;
     page.internal_flags.dirty = true;
     var temp_data: [PageSize]u8 = undefined;
-    std.mem.copyForwards(u8, &temp_data, &page.data);
+    @memcpy(&temp_data, &page.data);
 
     var temp_page_if: DataPageInterface = .{ .data = &temp_data };
     var original_page_if: DataPageInterface = .{ .data = &page.data };
@@ -306,6 +591,10 @@ fn splitDataPage(page: *NitreDbPage, nitreDb: *NitreDb, upper_bound_id: u64) !*N
     }
 
     var new_page = try nitreDb.db_page_pool.acquirePageNew(nitreDb);
+    if (new_page.page_number == page.page_number) {
+        std.debug.print("Invalid new page number: {}\n", .{new_page.page_number});
+        std.debug.assert(new_page.page_number != page.page_number);
+    }
     new_page.internal_flags.dirty = true;
     new_page.header.content_type = .Data;
     address_counter = PageHeaderSize;
@@ -327,6 +616,13 @@ fn splitDataPage(page: *NitreDbPage, nitreDb: *NitreDb, upper_bound_id: u64) !*N
     new_page.header.next_page = page.header.next_page;
     page.header.next_page = new_page.page_number;
 
+    if (new_page.header.next_page != null) {
+        var next_page = try nitreDb.db_page_pool.acquirePageExisting(nitreDb, new_page.header.next_page.?);
+        next_page.header.prev_page = new_page.page_number;
+        next_page.internal_flags.dirty = true;
+        nitreDb.db_page_pool.releasePage(next_page);
+    }
+
     return new_page;
 }
 
@@ -334,29 +630,45 @@ pub fn insertRecord(nitreDb: *NitreDb, record: []const u8, id: u64) !void {
     var page_opt: ?*NitreDbPage = null;
     if (nitreDb.db_header.page_count == 0) {
         page_opt = try nitreDb.db_page_pool.acquirePageNew(nitreDb);
-        page_opt.?.header.content_type = .Data;
+        page_opt.?.header.content_type = .PrimaryIndex;
         nitreDb.db_header.first_data_page = page_opt.?.page_number;
     } else {
         page_opt = try nitreDb.db_page_pool.acquirePageExisting(nitreDb, nitreDb.db_header.first_data_page);
     }
     var page = page_opt.?;
     page.internal_flags.dirty = true;
-    const page_number = page.page_number;
     nitreDb.db_page_pool.releasePage(page);
-    const record_len: u32 = @intCast(record.len);
 
+    const record_len: u32 = @intCast(record.len);
     var data_buffer: [1024]u8 = undefined;
     var io_writer = std.Io.Writer.fixed(&data_buffer);
     try io_writer.writeInt(u64, id, .little);
     try io_writer.writeInt(u32, record_len, .little);
     try io_writer.writeAll(record);
 
-    _ = try insertDataWithId(nitreDb, page_number, data_buffer[0 .. record_len + 12], id);
+    const new_root = try insertDataWithId(nitreDb, data_buffer[0 .. record_len + 12], id);
+    nitreDb.db_header.first_data_page = new_root;
 }
 
-pub fn walkRecordsTest(nitreDb: *NitreDb) !void {
+pub fn walkRecordsTest(nitreDb: *NitreDb) !u64 {
     var print_buffer: [128]u8 = undefined;
     var page_number: u32 = nitreDb.db_header.first_data_page;
+
+    while (true) {
+        const index_page = try nitreDb.db_page_pool.acquirePageExisting(nitreDb, page_number);
+        defer nitreDb.db_page_pool.releasePage(index_page);
+        if (index_page.header.content_type == .Data) {
+            break;
+        }
+        var index_reader = std.Io.Reader.fixed(&index_page.data);
+        index_reader.seek = PageSize - PrimaryIndexSlot.Size;
+        const first_slot = try index_reader.takeStruct(PrimaryIndexSlot, .little);
+        page_number = first_slot.page_number;
+    }
+
+    var count: u64 = 0;
+    var largest_id: u64 = 0;
+
     while (page_number != std.math.maxInt(u32)) {
         var page = try nitreDb.db_page_pool.acquirePageExisting(nitreDb, page_number);
         defer nitreDb.db_page_pool.releasePage(page);
@@ -364,13 +676,19 @@ pub fn walkRecordsTest(nitreDb: *NitreDb) !void {
         for (0..page.header.slot_count) |idx| {
             const slot_idx: u16 = @intCast(idx);
             const slot = page.data_interface.readSlot(slot_idx);
-            reader.seek = slot.offset + 8;
+            reader.seek = slot.offset;
+            const id = try reader.takeInt(u64, .little);
             const len = try reader.takeInt(u32, .little);
             try reader.readSliceAll(print_buffer[0..len]);
             std.debug.print("{s} (Page number: {})\n", .{ print_buffer[0..len], page_number });
+            count += 1;
+            std.debug.assert(id >= largest_id);
+            largest_id = id;
         }
         page_number = page.header.next_page orelse std.math.maxInt(u32);
     }
+
+    return count;
 }
 
 pub fn flushDatabase(nitreDb: *NitreDb) !void {
@@ -384,9 +702,12 @@ pub fn closeDatabase(nitreDb: *NitreDb) void {
 }
 
 pub fn openDatabase(filepath: []const u8, io: std.Io, allocator: std.mem.Allocator) !NitreDb {
+    comptime std.debug.assert((PageSize - PageHeaderSize) / PrimaryIndexSlot.Size > MaxPrimaryIndexSlotsPerPage);
+
     const file = try std.Io.Dir.createFileAbsolute(io, filepath, .{ .truncate = false, .read = true });
     errdefer file.close(io);
     var page_pool = try PagePool.init(MinPagePoolSize, allocator);
+    //var page_pool = try PagePool.init(1000, allocator);
     errdefer page_pool.deinit(allocator);
     const file_length = try file.length(io);
     var header: NitreDbHeader = .{};
@@ -467,7 +788,11 @@ const PagePool = struct {
                 .data_interface = .{
                     .data = &page.data,
                 },
+                .pindex_interface = .{
+                    .data = &page.data,
+                },
             };
+            page.initInterface();
         }
 
         return .{
@@ -483,24 +808,36 @@ const PagePool = struct {
 
     //Gets a page from the pool, freeing the oldest if none are available
     fn getFreePage(pool: *PagePool, nitreDb: *NitreDb) !*NitreDbPage {
-        var oldest_page: *NitreDbPage = &pool.pages[0];
+        var oldest_unacquired: *NitreDbPage = &pool.pages[0];
+
+        for (pool.pages) |*page| {
+            if (!page.internal_flags.acquired) {
+                oldest_unacquired = page;
+                break;
+            }
+        }
+
+        if (oldest_unacquired.internal_flags.acquired) {
+            return error.AllPagesAcquired;
+        }
 
         for (pool.pages) |*page| {
             if (!page.internal_flags.resident) {
                 return page;
             }
 
-            if (page.last_used < oldest_page.last_used)
-                oldest_page = page;
+            if (page.last_used < oldest_unacquired.last_used and !page.internal_flags.acquired)
+                oldest_unacquired = page;
         }
 
         //Evict page from the pool because it's the oldest and the pool is full
-        if (oldest_page.internal_flags.dirty) {
-            try writePageToDisk(nitreDb, oldest_page);
-            oldest_page.internal_flags.dirty = false;
+        if (oldest_unacquired.internal_flags.dirty) {
+            try writePageToDisk(nitreDb, oldest_unacquired);
+            oldest_unacquired.internal_flags.dirty = false;
         }
 
-        return oldest_page;
+        std.debug.assert(oldest_unacquired.internal_flags.acquired == false);
+        return oldest_unacquired;
     }
 
     //Finds a page already loaded into the pool by its number
@@ -525,18 +862,22 @@ const PagePool = struct {
             .data_interface = .{
                 .data = &page.data,
             },
+            .pindex_interface = .{
+                .data = &page.data,
+            },
         };
         page.initInterface();
         pool.last_used_counter += 1;
         pool.active_page_count += 1;
         nitreDb.db_header.page_count += 1;
 
-        std.debug.print("Acquiring page: {*} (Page number: {})\n", .{ page, page.page_number });
+        std.debug.print("Acquiring new page: {*} (Page number: {})\n", .{ page, page.page_number });
         return page;
     }
 
     //Gets a free page from the pool and loads the contents from disk
     fn acquirePageExisting(pool: *PagePool, nitreDb: *NitreDb, page_number: u32) !*NitreDbPage {
+        std.debug.assert(page_number < nitreDb.db_header.page_count);
         if (pool.active_page_count >= MaxAcquiredPages) {
             return error.MaxAcquisitionsReached;
         }
@@ -546,6 +887,7 @@ const PagePool = struct {
                 return error.PageAlreadyAcquired;
             }
             pool.active_page_count += 1;
+            found_page.?.internal_flags.acquired = true;
             return found_page.?;
         }
 
